@@ -1,3 +1,14 @@
+"""
+Парсер Яндекс Афиши — Калининград.
+
+Стратегия: вместо редакционных подборок (hot/spectacl), которые меняются
+редко и дают одни и те же события, парсим напрямую категорийные страницы.
+Каждая категория отсортирована по дате → всегда свежий контент.
+
+Категории обходятся по очереди, из каждой берём по 1–2 события.
+Итого при max_total=10 охватываем 5–8 разных категорий.
+"""
+
 import asyncio
 import re
 from typing import TypedDict, Optional
@@ -14,23 +25,32 @@ class EventData(TypedDict):
     ticket_url: str
     afisha_url: str
     image_url: str
+    category: str  # новое поле — категория события
 
 
-# ─── Источники для сбора ────────────────────────────────────────────────────
+# ─── Категорийные страницы (приоритет по убыванию) ──────────────────────────
+# Берём только те категории, где реально есть события с билетами.
+# Порядок важен: первые категории обходятся первыми.
 
-HOT_URL = (
-    "https://afisha.yandex.ru/kaliningrad/selections/"
-    "hot?source=selection-events&city=kaliningrad"
-)
-STANDUP_URL = "https://afisha.yandex.ru/kaliningrad/standup?source=menu"
-SPECTACL_URL = "https://afisha.yandex.ru/kaliningrad/selections/spectacl"
-SPECTACL_FALLBACK_URL = "https://afisha.yandex.ru/kaliningrad/theatre?source=menu"
+CATEGORIES = [
+    ("concert",     "Концерты"),
+    ("theatre",     "Театр"),
+    ("festival",    "Фестивали"),
+    ("standup",     "Стендап"),
+    ("show",        "Шоу"),
+    ("art",         "Выставки"),
+    ("kids",        "Детям"),
+    ("musical",     "Мюзиклы"),
+    ("excursions",  "Экскурсии"),
+    ("masterclass", "Мастер-классы"),
+    ("lectures",    "Лекции"),
+]
 
-# ─── Параметры ──────────────────────────────────────────────────────────────
+BASE_URL = "https://afisha.yandex.ru/kaliningrad"
 
-BROWSER_OPTIONS = {
-    "headless": True,
-}
+# ─── Параметры браузера ──────────────────────────────────────────────────────
+
+BROWSER_OPTIONS = {"headless": True}
 
 CONTEXT_OPTIONS = {
     "user_agent": (
@@ -42,131 +62,93 @@ CONTEXT_OPTIONS = {
     "viewport": {"width": 1280, "height": 900},
 }
 
-# Сколько «лишних» URL пробуем сверх лимита, чтобы компенсировать
-# уже обработанные/невалидные события.
-ATTEMPT_BUFFER = 4
+# Паттерн URL мероприятия: /kaliningrad/КАТЕГОРИЯ/СЛАГ
+EVENT_URL_RE = re.compile(r"/kaliningrad/[a-z]+/[a-z0-9][a-z0-9\-]{2,}$")
+
+# Слаги которые выглядят как события, но на деле являются листинговыми страницами
+_SLUG_BLACKLIST = re.compile(
+    r"/(all|vse|events|selections|search|cinema|afisha|"
+    r"top|new|soon|today|weekend|popular|recommended)$"
+)
+
+# Если в title есть эти паттерны — это листинг, а не конкретное мероприятие
+_LISTING_TITLE_RE = re.compile(
+    r"^(Все|Лучшие|Популярные|Топ|Афиша|Расписание)\s.+(Калининград|калинин)",
+    re.IGNORECASE,
+)
 
 
-# ─── Умный скролл (до стабилизации высоты) ──────────────────────────────────
+# ─── Загрузка страницы категории ────────────────────────────────────────────
 
 
-async def _scroll_until_stable(
-    page: Page,
-    max_scrolls: int = 15,
-    pause_sec: float = 1.3,
-) -> int:
-    """Скроллит страницу вниз, пока высота документа не перестанет расти.
+async def _load_category_page(page: Page, category: str) -> list[str]:
+    """Открывает страницу категории и собирает ссылки на мероприятия.
 
-    Возвращает количество сделанных скролл-шагов.
-    Бесконечная лента на Яндекс Афише догружает события при скролле —
-    фиксированное число шагов может не добраться до всех событий.
+    Выполняет один скролл для подгрузки событий.
+    Возвращает список абсолютных URL (дедуплицированных).
     """
-    prev_height = await page.evaluate("document.body.scrollHeight")
+    url = f"{BASE_URL}/{category}?source=menu"
+    logger.info(f"Loading category [{category}]: {url}")
 
-    for step in range(1, max_scrolls + 1):
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(pause_sec)
-
-        new_height = await page.evaluate("document.body.scrollHeight")
-        logger.debug(f"Scroll step {step}: height {prev_height} → {new_height}")
-
-        if new_height == prev_height:
-            logger.info(f"Page height stabilised after {step} scroll(s)")
-            return step
-
-        prev_height = new_height
-
-    logger.info(f"Reached max scrolls ({max_scrolls}), stopping")
-    return max_scrolls
-
-
-# ─── Сбор URL событий с одной страницы-источника ────────────────────────────
-
-
-async def _get_event_urls(page: Page, base_url: str) -> list[str]:
-    """Загружает страницу-подборку, скроллит, собирает ссылки на мероприятия.
-
-    Возвращает список абсолютных URL мероприятий (дедуплицированный).
-    При HTTP-ошибке (4xx/5xx) возвращает пустой список.
-    """
-    logger.info(f"Opening source page: {base_url}")
-    response = await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-
-    # Проверка HTTP-статуса
-    if response and response.status >= 400:
-        logger.warning(
-            f"HTTP {response.status} for {base_url}, skipping this source"
-        )
+    try:
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if response and response.status >= 400:
+            logger.warning(f"HTTP {response.status} for [{category}], skipping")
+            return []
+    except Exception as e:
+        logger.warning(f"Failed to load [{category}]: {e}")
         return []
 
-    # Ждём появления хотя бы 3 ссылок на мероприятия
+    # Ждём появления карточек событий
     try:
         await page.wait_for_function(
-            "document.querySelectorAll('a[href*=\"/kaliningrad/\"]').length > 3",
-            timeout=20000,
+            "document.querySelectorAll('a[href*=\"/kaliningrad/\"]').length > 2",
+            timeout=15000,
         )
-        logger.info("Event links found on the page")
     except Exception:
-        logger.warning(
-            "Fewer than 3 event links detected, but proceeding anyway"
-        )
+        logger.warning(f"[{category}] Timeout waiting for event links")
 
-    await asyncio.sleep(2)
-
-    # Скроллим, пока подгружаются новые события
-    await _scroll_until_stable(page)
+    # Один скролл — подгружает следующую порцию событий
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
+    await asyncio.sleep(1.5)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1.5)
 
-    # Собираем все ссылки
     hrefs: list[str] = await page.eval_on_selector_all(
         "a[href]", "els => els.map(e => e.getAttribute('href'))"
     )
 
-    # Универсальный паттерн: /kaliningrad/ЛЮБАЯ_КАТЕГОРИЯ/слаг
-    event_pattern = re.compile(r"/kaliningrad/[a-z]+/[a-z0-9\-]+")
+    urls: list[str] = []
+    seen: set[str] = set()
 
-    urls: set[str] = set()
     for href in hrefs:
         if not href:
             continue
-        clean = href.split("?")[0].split("#")[0]
-        if event_pattern.search(clean):
-            if clean.startswith("/"):
-                clean = "https://afisha.yandex.ru" + clean
-            urls.add(clean)
+        clean = href.split("?")[0].split("#")[0].rstrip("/")
+        if not EVENT_URL_RE.search(clean):
+            continue
+        if clean.startswith("/"):
+            clean = "https://afisha.yandex.ru" + clean
+        if clean not in seen and not _SLUG_BLACKLIST.search(clean):
+            seen.add(clean)
+            urls.append(clean)
 
-    logger.info(
-        f"Source [{base_url.split('/')[-1].split('?')[0]}]: "
-        f"found {len(urls)} unique event URLs"
-    )
-    return list(urls)
-
-
-# ─── Парсинг одной страницы мероприятия ─────────────────────────────────────
+    logger.info(f"[{category}] Found {len(urls)} event URLs")
+    return urls
 
 
-async def _extract_ticket_url(soup: BeautifulSoup, page_url: str) -> str:
-    """Всегда возвращает ссылку на страницу мероприятия на Яндекс Афише."""
-    return page_url
+# ─── Парсинг страницы одного события ────────────────────────────────────────
 
 
-async def _parse_event_page(page: Page, url: str) -> Optional[EventData]:
-    """Открывает страницу одного мероприятия и извлекает данные.
-
-    Использует BeautifulSoup для парсинга HTML, полученного через Playwright.
-    """
+async def _parse_event_page(page: Page, url: str, category: str = "") -> Optional[EventData]:
+    """Открывает страницу мероприятия и извлекает данные."""
     try:
-        response = await page.goto(
-            url, wait_until="domcontentloaded", timeout=30000
-        )
-
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
         if response and response.status >= 400:
-            logger.warning(
-                f"HTTP {response.status} for event page {url}, skipping"
-            )
+            logger.warning(f"HTTP {response.status} for {url}, skipping")
             return None
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1.5)
 
         html = await page.content()
         soup = BeautifulSoup(html, "lxml")
@@ -176,11 +158,20 @@ async def _parse_event_page(page: Page, url: str) -> Optional[EventData]:
             or _text(soup, "[class*='Title']")
             or _text(soup, "[class*='title']")
         )
+        if not title:
+            logger.debug(f"No title at {url}, skipping")
+            return None
+
+        # Фильтруем листинговые страницы по заголовку
+        if _LISTING_TITLE_RE.match(title):
+            logger.info(f"Skipping listing page: '{title}' ({url})")
+            return None
 
         date = (
             _text(soup, "time")
             or _text(soup, "[class*='Date']")
             or _text(soup, "[class*='date']")
+            or _text(soup, "[class*='Schedule']")
             or _text(soup, "[class*='schedule']")
         )
 
@@ -201,24 +192,18 @@ async def _parse_event_page(page: Page, url: str) -> Optional[EventData]:
             or _attr(soup, "[class*='poster'] img", "src")
             or _attr(soup, "[class*='Image'] img", "src")
         )
-
         if image_url:
             image_url = _clean_image_url(image_url)
-
-        ticket_url = await _extract_ticket_url(soup, url)
-
-        if not title:
-            logger.info(f"No title found at {url}, skipping")
-            return None
 
         return EventData(
             title=title,
             date=date or "",
             place=place or "",
             description=description or "",
-            ticket_url=ticket_url,
+            ticket_url=url,
             afisha_url=url,
             image_url=image_url or "",
+            category=category,
         )
 
     except Exception as e:
@@ -226,7 +211,7 @@ async def _parse_event_page(page: Page, url: str) -> Optional[EventData]:
         return None
 
 
-# ─── Вспомогательные утилиты для BS4 ────────────────────────────────────────
+# ─── Вспомогательные утилиты ────────────────────────────────────────────────
 
 
 def _text(soup: BeautifulSoup, selector: str) -> str:
@@ -280,22 +265,113 @@ def _clean_image_url(url: str) -> str:
 
 
 def _is_valid(event: EventData) -> bool:
-    return bool(event.get("title") and event.get("afisha_url"))
+    if not event.get("title") or not event.get("afisha_url"):
+        return False
+    # Листинговые страницы часто не имеют ни места ни нормальной даты
+    has_date = bool(event.get("date") and len(event["date"]) > 3)
+    has_place = bool(event.get("place"))
+    return has_date or has_place
 
 
-# ─── Парсинг с ОДНОГО источника (обратная совместимость) ────────────────────
+# ─── Главная функция ─────────────────────────────────────────────────────────
+
+
+async def parse_all_events(max_total: int = 5) -> list[EventData]:
+    """Собирает события из категорийных страниц Яндекс Афиши.
+
+    Алгоритм:
+    1. Вычисляем сколько событий берём из каждой категории (per_category).
+    2. Обходим категории по очереди, из каждой парсим per_category событий.
+    3. Если одна категория не даёт нужного числа — берём что есть и идём дальше.
+    4. Дедупликация по afisha_url.
+
+    Args:
+        max_total: Желаемое суммарное число событий (из settings.parse_count).
+
+    Returns:
+        Список EventData, не более max_total штук.
+    """
+    # Сколько категорий задействовать и сколько событий с каждой
+    # При max_total=5  → 5 категорий по 1
+    # При max_total=10 → 5 категорий по 2
+    # При max_total=3  → 3 категории по 1
+    per_category = max(1, max_total // min(max_total, len(CATEGORIES)))
+    num_categories = (max_total + per_category - 1) // per_category  # ceil
+    active_categories = CATEGORIES[:num_categories]
+
+    logger.info(
+        f"parse_all_events: max_total={max_total}, "
+        f"categories={num_categories}, per_category={per_category}"
+    )
+
+    all_events: list[EventData] = []
+    seen_urls: set[str] = set()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(**BROWSER_OPTIONS)
+        context = await browser.new_context(**CONTEXT_OPTIONS)
+        page = await context.new_page()
+
+        for cat_slug, cat_label in active_categories:
+            if len(all_events) >= max_total:
+                break
+
+            # Шаг 1: получаем список URL из категории
+            event_urls = await _load_category_page(page, cat_slug)
+            if not event_urls:
+                logger.warning(f"[{cat_slug}] No URLs, skipping category")
+                continue
+
+            # Шаг 2: парсим по per_category событий из категории
+            # Пробуем до per_category * 3 URL чтобы найти per_category валидных
+            cat_parsed = 0
+            for url in event_urls[: per_category * 3]:
+                if cat_parsed >= per_category:
+                    break
+                if url in seen_urls:
+                    continue
+
+                await asyncio.sleep(1.0)
+                event = await _parse_event_page(page, url, category=cat_label)
+
+                if event and _is_valid(event):
+                    seen_urls.add(url)
+                    all_events.append(event)
+                    cat_parsed += 1
+                    logger.info(
+                        f"[{cat_slug}] #{cat_parsed}: {event['title']} | {event['date']}"
+                    )
+
+                if len(all_events) >= max_total:
+                    break
+
+            logger.info(f"[{cat_slug}] Done: {cat_parsed}/{per_category}")
+
+        await browser.close()
+
+    logger.info(
+        f"Total parsed: {len(all_events)} events from "
+        f"{len(set(e['category'] for e in all_events))} categories"
+    )
+    return all_events
+
+
+# ─── Обратная совместимость ──────────────────────────────────────────────────
 
 
 async def parse_events_from_url(
     afisha_url: str, max_events: int = 5
 ) -> list[EventData]:
-    """Парсит события с указанного URL Яндекс Афиши.
+    """Парсит события с произвольного URL категории.
 
-    Создаёт отдельный браузер (удобно для одиночного вызова).
-    Для многократного вызова используйте parse_all_events() —
-    он переиспользует один браузер для всех источников.
+    Оставлен для обратной совместимости.
+    Для регулярного сбора используйте parse_all_events().
     """
     events: list[EventData] = []
+
+    # Определяем slug категории из URL
+    m = re.search(r"/kaliningrad/([a-z]+)", afisha_url)
+    cat_label = m.group(1) if m else ""
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**BROWSER_OPTIONS)
@@ -303,185 +379,17 @@ async def parse_events_from_url(
         page = await context.new_page()
 
         try:
-            urls = await _get_event_urls(page, afisha_url)
-            if not urls:
-                logger.warning(
-                    f"No event URLs found on {afisha_url} — "
-                    "check page structure or HTTP status"
-                )
-
+            urls = await _load_category_page(page, cat_label or afisha_url)
             for url in urls[: max_events * 3]:
-                await asyncio.sleep(1.5)
-                event = await _parse_event_page(page, url)
+                await asyncio.sleep(1.0)
+                event = await _parse_event_page(page, url, category=cat_label)
                 if event and _is_valid(event):
                     events.append(event)
-                    logger.info(
-                        f"Parsed: {event['title']} | "
-                        f"билеты: {event['ticket_url']}"
-                    )
                 if len(events) >= max_events:
                     break
-
         except Exception as e:
-            logger.error(f"Parser error on {afisha_url}: {e}")
+            logger.error(f"Parser error: {e}")
         finally:
             await browser.close()
 
-    logger.info(f"Parsed {len(events)} events from {afisha_url}")
     return events
-
-
-# ─── Оркестратор — сбор со ВСЕХ источников (ОДИН браузер) ──────────────────
-
-
-async def parse_all_events(max_total: int = 5) -> list[EventData]:
-    """Собирает события из нескольких источников Яндекс Афиши.
-
-    Распределение лимитов по источникам:
-    - hot (selection)  → max_total - 2 (минимум 3)
-    - standup          → 1
-    - spectacl         → 1
-    - fallback на theatre, если spectacl пустой
-
-    Для каждого источника пробуем limit * ATTEMPT_BUFFER URL-адресов,
-    чтобы заполнить квоту даже при наличии невалидных страниц.
-    Дедупликация по afisha_url.
-
-    Args:
-        max_total: Суммарное желаемое количество событий.
-                   Прокидывается из settings.parse_count.
-
-    Returns:
-        Список EventData (до max_total штук).
-    """
-    # ── Распределяем лимиты ──────────────────────────────────────────────
-    # standup и spectacl всегда по 1; остаток отдаём hot (минимум 3)
-    standup_limit = 1
-    spectacl_limit = 1
-    hot_limit = max(3, max_total - standup_limit - spectacl_limit)
-
-    limits = {
-        "hot": hot_limit,
-        "standup": standup_limit,
-        "spectacl": spectacl_limit,
-    }
-
-    sources: list[tuple[str, str]] = [
-        (HOT_URL, "hot"),
-        (STANDUP_URL, "standup"),
-        (SPECTACL_URL, "spectacl"),
-    ]
-
-    logger.info(
-        f"parse_all_events: max_total={max_total}, "
-        f"limits=hot:{hot_limit} standup:{standup_limit} spectacl:{spectacl_limit}"
-    )
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**BROWSER_OPTIONS)
-        context = await browser.new_context(**CONTEXT_OPTIONS)
-
-        # ── Шаг 1: собираем URL со всех источников ─────────────────────────
-        collected: dict[str, list[str]] = {}
-
-        for source_url, label in sources:
-            logger.info(f"Collecting URLs from [{label}]: {source_url}")
-            page = await context.new_page()
-            try:
-                urls = await _get_event_urls(page, source_url)
-                collected[label] = urls
-            except Exception as e:
-                logger.warning(f"Failed to collect [{label}]: {e}")
-                collected[label] = []
-            finally:
-                await page.close()
-
-        # ── Fallback: если spectacl пустой, пробуем theatre ────────────────
-        if not collected.get("spectacl"):
-            logger.info(
-                "spectacl returned 0 events, "
-                f"trying fallback: {SPECTACL_FALLBACK_URL}"
-            )
-            page = await context.new_page()
-            try:
-                urls = await _get_event_urls(page, SPECTACL_FALLBACK_URL)
-                collected["spectacl"] = urls
-            except Exception as e:
-                logger.warning(f"Fallback [spectacl] also failed: {e}")
-                collected["spectacl"] = []
-            finally:
-                await page.close()
-
-        # ── Шаг 2: парсим каждое мероприятие ───────────────────────────────
-        page = await context.new_page()
-        all_events: list[EventData] = []
-        seen_urls: set[str] = set()
-
-        for label in ["hot", "standup", "spectacl"]:
-            source_urls = collected.get(label, [])
-            limit = limits[label]
-            # Пробуем limit * ATTEMPT_BUFFER URL-ов, чтобы набрать limit валидных
-            attempt_cap = limit * ATTEMPT_BUFFER
-            parsed_count = 0
-            attempt_count = 0
-
-            logger.info(
-                f"Parsing [{label}]: {len(source_urls)} URLs available, "
-                f"limit={limit}, attempt_cap={attempt_cap}"
-            )
-
-            for url in source_urls:
-                if parsed_count >= limit:
-                    break
-                if attempt_count >= attempt_cap:
-                    logger.info(
-                        f"[{label}] Reached attempt cap ({attempt_cap}), stopping"
-                    )
-                    break
-
-                attempt_count += 1
-                await asyncio.sleep(1.2)
-                event = await _parse_event_page(page, url)
-
-                if event and _is_valid(event):
-                    afisha_url = event.get("afisha_url", "")
-                    if afisha_url and afisha_url not in seen_urls:
-                        seen_urls.add(afisha_url)
-                        all_events.append(event)
-                        parsed_count += 1
-                        logger.info(
-                            f"[{label}] Parsed #{parsed_count}: {event['title']}"
-                        )
-
-            logger.info(
-                f"[{label}] Done: {parsed_count}/{limit} events "
-                f"after {attempt_count} attempts"
-            )
-
-        await browser.close()
-
-    # ── Итоговая статистика ─────────────────────────────────────────────────
-    hot_count = sum(
-        1 for e in all_events
-        if e["afisha_url"].startswith(HOT_URL.split("/selections")[0])
-    )
-    standup_count = sum(1 for e in all_events if "standup" in e["afisha_url"])
-    spectacl_count = sum(
-        1 for e in all_events
-        if "spectacl" in e["afisha_url"] or "theatre" in e["afisha_url"]
-    )
-
-    logger.info(
-        f"Parsed successfully: {len(all_events)} unique events "
-        f"(hot={hot_count}/{limits['hot']}, "
-        f"standup={standup_count}/{limits['standup']}, "
-        f"spectacl={spectacl_count}/{limits['spectacl']})"
-    )
-    logger.info(
-        f"URLs collected: "
-        f"hot={len(collected.get('hot', []))}, "
-        f"standup={len(collected.get('standup', []))}, "
-        f"spectacl={len(collected.get('spectacl', []))}"
-    )
-
-    return all_events
