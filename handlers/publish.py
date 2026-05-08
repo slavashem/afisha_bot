@@ -16,7 +16,6 @@ from utils.logger import logger
 router = Router()
 
 # Временный кеш: admin_id → list[EventData]
-# Хранит события, полученные при /check, до выбора админом.
 _pending_events: dict[int, list[dict]] = {}
 
 
@@ -30,20 +29,21 @@ class Flow(StatesGroup):
 # ─── Show event list ────────────────────────────────────────────────────────
 
 async def send_events_list(bot: Bot, admin_id: int, events: list[dict], config: Config) -> None:
-    """Показывает админу список новых событий (ещё не сохранённых в БД).
+    """Показывает админу список новых событий.
 
-    В качестве идентификатора используется индекс в списке (callback_data).
-    Список событий сохраняется в модульном кеше _pending_events для последующего выбора.
+    Каждая строка содержит две кнопки:
+      • [#N Название]  — выбрать и начать публикацию
+      • [🚫]           — сразу пометить как игнорируемое
     """
     if not events:
         await bot.send_message(admin_id, "Новых мероприятий не найдено.")
         return
 
-    # Сохраняем в кеш, чтобы on_select_event мог получить полные данные события
     _pending_events[admin_id] = events
 
     text = "📋 <b>Найденные мероприятия:</b>\n\n"
     buttons = []
+
     for i, ev in enumerate(events):
         idx = i + 1
         title = ev.get("title", "—")
@@ -57,10 +57,16 @@ async def send_events_list(bot: Bot, admin_id: int, events: list[dict], config: 
             text += f"   📍 {place}\n"
         text += f"   🎟 <a href='{ev.get('afisha_url', '')}'>страница афиши</a>\n\n"
 
-        buttons.append([InlineKeyboardButton(
-            text=f"#{idx} {title[:35]}",
-            callback_data=f"select_event:{i}"
-        )])
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"#{idx} {title[:30]}",
+                callback_data=f"select_event:{i}",
+            ),
+            InlineKeyboardButton(
+                text="🚫",
+                callback_data=f"ignore_listed:{i}",
+            ),
+        ])
 
     await bot.send_message(
         admin_id, text,
@@ -74,14 +80,72 @@ async def send_events_list(bot: Bot, admin_id: int, events: list[dict], config: 
 
 def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
 
+    # ── Игнорировать прямо из списка ────────────────────────────────────────
+
+    @router.callback_query(F.data.startswith("ignore_listed:"))
+    async def on_ignore_listed(callback: CallbackQuery) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        index = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        cached: list[dict] = _pending_events.get(user_id, [])
+
+        if index >= len(cached):
+            await callback.answer("Событие не найдено")
+            return
+
+        event = cached[index]
+
+        await save_event(
+            {**event, "telegram_text": "", "instagram_text": ""},
+            status="ignored",
+            db_path=config.db_path,
+        )
+
+        # Убираем строку из кеша и перерисовываем клавиатуру
+        cached.pop(index)
+        _pending_events[user_id] = cached
+
+        title = event.get("title", "—")
+        await callback.answer(f"🚫 «{title[:40]}» — игнорировано")
+
+        # Перестраиваем кнопки (индексы сдвинулись после pop)
+        if cached:
+            new_buttons = []
+            for i, ev in enumerate(cached):
+                t = ev.get("title", "—")
+                new_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"#{i + 1} {t[:30]}",
+                        callback_data=f"select_event:{i}",
+                    ),
+                    InlineKeyboardButton(
+                        text="🚫",
+                        callback_data=f"ignore_listed:{i}",
+                    ),
+                ])
+            try:
+                await callback.message.edit_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=new_buttons)
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await callback.message.answer("✅ Все мероприятия из списка обработаны.")
+
+    # ── Выбрать событие для публикации ──────────────────────────────────────
+
     @router.callback_query(F.data.startswith("select_event:"))
     async def on_select_event(callback: CallbackQuery, state: FSMContext) -> None:
         if callback.from_user.id != config.admin_id:
             return
 
         index = int(callback.data.split(":")[1])
-
-        # Берём список событий из кеша
         user_id = callback.from_user.id
         cached: list[dict] = _pending_events.get(user_id, [])
 
@@ -97,7 +161,6 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         )
         await callback.answer()
 
-        # Generate Telegram text
         tg_text, tg_ok = await generate_telegram_post(event, config)
         ig_text, ig_ok = await generate_instagram_post(event, config)
 
@@ -117,7 +180,6 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
             ig_text=ig_text,
         )
 
-        # Search for images
         await callback.message.answer("🔍 Ищу фото в интернете...")
         query = build_image_query(event)
         image_urls = await search_event_images(query, count=5)
@@ -142,8 +204,8 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
                     photo=img_url,
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(
-                            text=f"✅ Выбрать это фото",
-                            callback_data=f"pick_photo:{i}"
+                            text="✅ Выбрать это фото",
+                            callback_data=f"pick_photo:{i}",
                         )
                     ]])
                 )
@@ -165,10 +227,9 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
 
         event = data.get("current_event", {})
         tg_text = data.get("tg_text", "")
-
         await _show_post_preview(callback.message, event, tg_text, selected_url, state)
 
-    # ── Игнорировать ────────────────────────────────────────────────────────
+    # ── Игнорировать (из предпросмотра) ─────────────────────────────────────
 
     @router.callback_query(F.data == "ignore_event", Flow.confirming_post)
     async def on_ignore_event(callback: CallbackQuery, state: FSMContext) -> None:
@@ -178,7 +239,6 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         data = await state.get_data()
         event = data.get("current_event", {})
 
-        # Сохраняем в БД со статусом ignored
         await save_event(
             {
                 **event,
@@ -247,7 +307,6 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         data = await state.get_data()
         event = data.get("current_event", {})
 
-        # Сохраняем в БД со статусом published
         event_id = await save_event(
             {
                 **event,
@@ -262,7 +321,6 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         ticket_url = event.get("ticket_url", "")
         afisha_url = event.get("afisha_url", "")
 
-        hint = ""
         if ticket_url and ticket_url != afisha_url:
             hint = f"\n\nСсылка на билеты с сайта: <code>{ticket_url}</code>"
         else:

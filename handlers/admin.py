@@ -13,15 +13,11 @@ router = Router()
 
 
 async def run_check(bot: Bot, config: Config) -> list[dict]:
-    """Парсит события и возвращает только новые (не обработанные ранее).
-
-    События НЕ сохраняются в БД — только проверяется, не было ли
-    это событие уже опубликовано или проигнорировано.
-    """
+    """Парсит события и возвращает только новые (не обработанные ранее)."""
     settings = get_settings()
     count = settings.parse_count
 
-    logger.info(f"Starting afisha check (max {count} events)...")
+    logger.info(f"Starting afisha check (parse_count={count})...")
     raw_events = await parse_all_events(max_total=count)
 
     new_events: list[dict] = []
@@ -36,7 +32,7 @@ async def run_check(bot: Bot, config: Config) -> list[dict]:
 
         new_events.append(raw)
 
-    logger.info(f"Check done. New: {len(new_events)}")
+    logger.info(f"Check done. Found {len(raw_events)} total, {len(new_events)} new.")
     return new_events
 
 
@@ -57,7 +53,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
     counts = [3, 5, 10]
     buttons = []
     for n in counts:
-        label = f"{'✅' if settings.parse_count == n else ''} {n} событий".strip()
+        label = f"{'✅' if settings.parse_count == n else '  '} {n} событий".strip()
         buttons.append(InlineKeyboardButton(text=label, callback_data=f"set_count:{n}"))
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
@@ -92,6 +88,7 @@ def register_admin_handlers(router: Router, bot: Bot, config: Config) -> None:
             return
         n = int(callback.data.split(":")[1])
         set_parse_count(n)
+        logger.info(f"parse_count updated to {n}")
         await callback.message.edit_reply_markup(reply_markup=_settings_keyboard())
         await callback.answer(f"Установлено: {n} событий")
 
@@ -100,7 +97,7 @@ def register_admin_handlers(router: Router, bot: Bot, config: Config) -> None:
         if message.from_user.id != config.admin_id:
             return
         s = get_settings()
-        await message.answer(f"🔍 Запускаю парсер (ищу {s.parse_count} событий)...")
+        await message.answer(f"🔍 Запускаю парсер (ищу до {s.parse_count} событий)...")
         try:
             events = await run_check(bot, config)
             if not events:
