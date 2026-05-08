@@ -1,0 +1,15 @@
+.env
+data/events.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.playwright/
+playwright/.local-browsers/
+.venv/
+venv/
+*.log
