@@ -3,7 +3,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import Config
-from database.db import event_exists, save_event
+from database.db import is_event_processed
 from parsers.yandex_afisha import parse_all_events
 from services.settings import get_settings, set_parse_count
 from utils.logger import logger
@@ -13,29 +13,31 @@ router = Router()
 
 
 async def run_check(bot: Bot, config: Config) -> list[dict]:
+    """Парсит события и возвращает только новые (не обработанные ранее).
+
+    События НЕ сохраняются в БД — только проверяется, не было ли
+    это событие уже опубликовано или проигнорировано.
+    """
     settings = get_settings()
     count = settings.parse_count
 
     logger.info(f"Starting afisha check (max {count} events)...")
     raw_events = await parse_all_events(max_total=count)
 
-    saved: list[dict] = []
+    new_events: list[dict] = []
     for raw in raw_events:
-        ticket_url = raw.get("ticket_url", "")
-        if not ticket_url:
-            continue
-        if await event_exists(ticket_url, config.db_path):
-            logger.info(f"Already exists: {raw.get('title')}")
+        afisha_url = raw.get("afisha_url", "")
+        if not afisha_url:
             continue
 
-        event_id = await save_event(
-            {**raw, "telegram_text": "", "instagram_text": ""},
-            config.db_path,
-        )
-        saved.append({**raw, "id": event_id})
+        if await is_event_processed(afisha_url, config.db_path):
+            logger.info(f"Already processed: {raw.get('title')}")
+            continue
 
-    logger.info(f"Check done. New: {len(saved)}")
-    return saved
+        new_events.append(raw)
+
+    logger.info(f"Check done. New: {len(new_events)}")
+    return new_events
 
 
 async def check_and_notify(bot: Bot, config: Config) -> None:
@@ -44,7 +46,7 @@ async def check_and_notify(bot: Bot, config: Config) -> None:
         if not events:
             await bot.send_message(config.admin_id, "✅ Проверка завершена. Новых мероприятий нет.")
         else:
-            await send_events_list(bot, config.admin_id, events)
+            await send_events_list(bot, config.admin_id, events, config)
     except Exception as e:
         logger.error(f"Scheduled check failed: {e}")
         await bot.send_message(config.admin_id, f"❌ Ошибка при проверке: {e}")
@@ -104,7 +106,7 @@ def register_admin_handlers(router: Router, bot: Bot, config: Config) -> None:
             if not events:
                 await message.answer("✅ Новых мероприятий не найдено.")
             else:
-                await send_events_list(bot, config.admin_id, events)
+                await send_events_list(bot, config.admin_id, events, config)
         except Exception as e:
             logger.error(f"Check failed: {e}")
             await message.answer(f"❌ Ошибка: {e}")

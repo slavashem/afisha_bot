@@ -17,8 +17,10 @@ EXPECTED_COLUMNS: dict[str, str] = {
     "image_url": "TEXT",
     "telegram_text": "TEXT",
     "instagram_text": "TEXT",
-    "published": "INTEGER DEFAULT 0",
+    "status": "TEXT NOT NULL DEFAULT 'published'",
     "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
+    "published_at": "TEXT",
+    "ignored_at": "TEXT",
 }
 
 
@@ -29,19 +31,33 @@ async def _migrate_db(db_path: str) -> None:
         existing = {row[1] for row in await cursor.fetchall()}
 
         missing = [name for name in EXPECTED_COLUMNS if name not in existing]
-        if not missing:
-            return
+        if missing:
+            logger.warning(f"Missing columns detected: {missing}. Running migration...")
+            for col_name in missing:
+                col_def = EXPECTED_COLUMNS[col_name]
+                try:
+                    await db.execute(
+                        f"ALTER TABLE events ADD COLUMN {col_name} {col_def}"
+                    )
+                    logger.info(f"Added missing column: {col_name} {col_def}")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name}: {e}")
 
-        logger.warning(f"Missing columns detected: {missing}. Running migration...")
-        for col_name in missing:
-            col_def = EXPECTED_COLUMNS[col_name]
-            try:
-                await db.execute(
-                    f"ALTER TABLE events ADD COLUMN {col_name} {col_def}"
-                )
-                logger.info(f"Added missing column: {col_name} {col_def}")
-            except Exception as e:
-                logger.error(f"Failed to add column {col_name}: {e}")
+        # Миграция: published → status
+        if "published" in existing:
+            logger.info("Migrating published column → status...")
+            # Устанавливаем status для старых записей
+            await db.execute(
+                "UPDATE events SET status = 'published' WHERE published = 1 AND status IS NULL"
+            )
+            await db.execute(
+                "UPDATE events SET status = 'ignored' WHERE published = 0 AND status IS NULL"
+            )
+            # Заполняем published_at для старых опубликованных
+            await db.execute(
+                "UPDATE events SET published_at = created_at WHERE status = 'published' AND published_at IS NULL"
+            )
+
         await db.commit()
 
 
@@ -59,8 +75,10 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 image_url TEXT,
                 telegram_text TEXT,
                 instagram_text TEXT,
-                published INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                status TEXT NOT NULL DEFAULT 'published',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                published_at TEXT,
+                ignored_at TEXT
             )
         """)
         await db.commit()
@@ -69,22 +87,25 @@ async def init_db(db_path: str = DB_PATH) -> None:
     logger.info("Database initialized")
 
 
-async def event_exists(afisha_url: str, db_path: str = DB_PATH) -> bool:
+async def is_event_processed(afisha_url: str, db_path: str = DB_PATH) -> bool:
+    """Проверяет, было ли событие уже опубликовано или проигнорировано."""
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
-            "SELECT id FROM events WHERE afisha_url = ?", (afisha_url,)
+            "SELECT id FROM events WHERE afisha_url = ? AND status IN ('published', 'ignored')",
+            (afisha_url,),
         ) as cursor:
             return await cursor.fetchone() is not None
 
 
-async def save_event(event: dict, db_path: str = DB_PATH) -> int:
+async def save_event(event: dict, status: str = "published", db_path: str = DB_PATH) -> int:
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
             """
             INSERT INTO events
                 (title, date, place, description, ticket_url, afisha_url, image_url,
-                 telegram_text, instagram_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 telegram_text, instagram_text, status, created_at, published_at, ignored_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.get("title"),
@@ -96,26 +117,45 @@ async def save_event(event: dict, db_path: str = DB_PATH) -> int:
                 event.get("image_url"),
                 event.get("telegram_text", ""),
                 event.get("instagram_text", ""),
-                datetime.utcnow().isoformat(),
+                status,
+                now,
+                now if status == "published" else None,
+                now if status == "ignored" else None,
             ),
         )
         await db.commit()
         return cursor.lastrowid
 
 
-async def get_unpublished_events(db_path: str = DB_PATH) -> list[dict]:
+async def update_event_status(event_id: int, status: str, db_path: str = DB_PATH) -> None:
+    now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM events WHERE published = 0 ORDER BY created_at ASC"
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        if status == "published":
+            await db.execute(
+                "UPDATE events SET status = ?, published_at = ? WHERE id = ?",
+                (status, now, event_id),
+            )
+        elif status == "ignored":
+            await db.execute(
+                "UPDATE events SET status = ?, ignored_at = ? WHERE id = ?",
+                (status, now, event_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE events SET status = ? WHERE id = ?",
+                (status, event_id),
+            )
+        await db.commit()
 
 
-async def mark_as_published(event_id: int, db_path: str = DB_PATH) -> None:
+async def update_event_text(
+    event_id: int, telegram_text: str, instagram_text: str, db_path: str = DB_PATH
+) -> None:
     async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE events SET published = 1 WHERE id = ?", (event_id,))
+        await db.execute(
+            "UPDATE events SET telegram_text = ?, instagram_text = ? WHERE id = ?",
+            (telegram_text, instagram_text, event_id),
+        )
         await db.commit()
 
 

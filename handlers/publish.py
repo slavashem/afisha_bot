@@ -7,7 +7,7 @@ from aiogram.types import (
 )
 
 from config import Config
-from database.db import get_event_by_id, mark_as_published
+from database.db import save_event
 from ai.text_generator import generate_telegram_post, generate_instagram_post
 from services.image_search import search_event_images, build_image_query
 from services.publisher import publish_to_channel, send_instagram_text
@@ -15,19 +15,32 @@ from utils.logger import logger
 
 router = Router()
 
+# Временный кеш: admin_id → list[EventData]
+# Хранит события, полученные при /check, до выбора админом.
+_pending_events: dict[int, list[dict]] = {}
+
 
 class Flow(StatesGroup):
     selecting_photo = State()
     confirming_post = State()
     waiting_ref_url = State()
+    editing_text = State()
 
 
 # ─── Show event list ────────────────────────────────────────────────────────
 
-async def send_events_list(bot: Bot, admin_id: int, events: list[dict]) -> None:
+async def send_events_list(bot: Bot, admin_id: int, events: list[dict], config: Config) -> None:
+    """Показывает админу список новых событий (ещё не сохранённых в БД).
+
+    В качестве идентификатора используется индекс в списке (callback_data).
+    Список событий сохраняется в модульном кеше _pending_events для последующего выбора.
+    """
     if not events:
         await bot.send_message(admin_id, "Новых мероприятий не найдено.")
         return
+
+    # Сохраняем в кеш, чтобы on_select_event мог получить полные данные события
+    _pending_events[admin_id] = events
 
     text = "📋 <b>Найденные мероприятия:</b>\n\n"
     buttons = []
@@ -36,24 +49,17 @@ async def send_events_list(bot: Bot, admin_id: int, events: list[dict]) -> None:
         title = ev.get("title", "—")
         date = ev.get("date", "")
         place = ev.get("place", "")
-        ticket = ev.get("ticket_url", "")
-        afisha = ev.get("afisha_url", "")
 
         text += f"{idx}. <b>{title}</b>\n"
         if date:
             text += f"   📅 {date}\n"
         if place:
             text += f"   📍 {place}\n"
-        # Show ticket URL status
-        if ticket and ticket != afisha:
-            text += f"   🎟 <a href='{ticket}'>Ссылка на билеты</a>\n"
-        else:
-            text += f"   🎟 Билеты: <a href='{afisha}'>страница афиши</a>\n"
-        text += "\n"
+        text += f"   🎟 <a href='{ev.get('afisha_url', '')}'>страница афиши</a>\n\n"
 
         buttons.append([InlineKeyboardButton(
             text=f"#{idx} {title[:35]}",
-            callback_data=f"select_event:{ev['id']}"
+            callback_data=f"select_event:{i}"
         )])
 
     await bot.send_message(
@@ -73,11 +79,17 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         if callback.from_user.id != config.admin_id:
             return
 
-        event_id = int(callback.data.split(":")[1])
-        event = await get_event_by_id(event_id, config.db_path)
-        if not event:
-            await callback.answer("Мероприятие не найдено")
+        index = int(callback.data.split(":")[1])
+
+        # Берём список событий из кеша
+        user_id = callback.from_user.id
+        cached: list[dict] = _pending_events.get(user_id, [])
+
+        if index >= len(cached):
+            await callback.answer("Событие не найдено")
             return
+
+        event = cached[index]
 
         await callback.message.answer(
             f"⏳ Генерирую текст через нейросеть для <b>{event['title']}</b>...",
@@ -99,7 +111,8 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
             await callback.message.answer("✅ Текст сгенерирован нейросетью")
 
         await state.update_data(
-            event_id=event_id,
+            current_event=event,
+            current_event_index=index,
             tg_text=tg_text,
             ig_text=ig_text,
         )
@@ -150,22 +163,104 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         await state.update_data(selected_image=selected_url)
         await callback.answer("Фото выбрано ✅")
 
-        event_id = data.get("event_id")
-        event = await get_event_by_id(event_id, config.db_path)
+        event = data.get("current_event", {})
         tg_text = data.get("tg_text", "")
 
         await _show_post_preview(callback.message, event, tg_text, selected_url, state)
+
+    # ── Игнорировать ────────────────────────────────────────────────────────
+
+    @router.callback_query(F.data == "ignore_event", Flow.confirming_post)
+    async def on_ignore_event(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        data = await state.get_data()
+        event = data.get("current_event", {})
+
+        # Сохраняем в БД со статусом ignored
+        await save_event(
+            {
+                **event,
+                "telegram_text": data.get("tg_text", ""),
+                "instagram_text": data.get("ig_text", ""),
+            },
+            status="ignored",
+            db_path=config.db_path,
+        )
+
+        await state.clear()
+        try:
+            await callback.message.edit_caption(
+                caption="🚫 Мероприятие проигнорировано.",
+                reply_markup=None,
+            )
+        except Exception:
+            await callback.message.answer("🚫 Мероприятие проигнорировано.")
+        await callback.answer("Игнорировано")
+
+    # ── Редактировать текст ─────────────────────────────────────────────────
+
+    @router.callback_query(F.data == "edit_text", Flow.confirming_post)
+    async def on_edit_text(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        data = await state.get_data()
+        tg_text = data.get("tg_text", "")
+
+        await state.set_state(Flow.editing_text)
+        await callback.message.answer(
+            f"✏️ <b>Текущий текст:</b>\n\n{tg_text}\n\n"
+            f"Отправьте новый текст для поста:",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+
+    @router.message(Flow.editing_text)
+    async def on_new_text(message: Message, state: FSMContext) -> None:
+        if message.from_user.id != config.admin_id:
+            return
+
+        new_text = (message.text or "").strip()
+        if not new_text:
+            await message.answer("❌ Текст не может быть пустым. Отправьте текст:")
+            return
+
+        await state.update_data(tg_text=new_text)
+        await state.set_state(Flow.confirming_post)
+
+        data = await state.get_data()
+        event = data.get("current_event", {})
+        image_url = data.get("selected_image") or event.get("image_url")
+
+        await message.answer("✅ Текст обновлён. Новый предпросмотр:")
+        await _show_post_preview(message, event, new_text, image_url, state)
+
+    # ── Опубликовать ────────────────────────────────────────────────────────
 
     @router.callback_query(F.data == "confirm_post", Flow.confirming_post)
     async def on_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         if callback.from_user.id != config.admin_id:
             return
-        data = await state.get_data()
-        event_id = data.get("event_id")
-        event = await get_event_by_id(event_id, config.db_path)
 
-        ticket_url = event.get("ticket_url", "") if event else ""
-        afisha_url = event.get("afisha_url", "") if event else ""
+        data = await state.get_data()
+        event = data.get("current_event", {})
+
+        # Сохраняем в БД со статусом published
+        event_id = await save_event(
+            {
+                **event,
+                "telegram_text": data.get("tg_text", ""),
+                "instagram_text": data.get("ig_text", ""),
+            },
+            status="published",
+            db_path=config.db_path,
+        )
+        await state.update_data(event_id=event_id)
+
+        ticket_url = event.get("ticket_url", "")
+        afisha_url = event.get("afisha_url", "")
 
         hint = ""
         if ticket_url and ticket_url != afisha_url:
@@ -202,8 +297,9 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         await state.clear()
 
         event_id = data.get("event_id")
-        event = await get_event_by_id(event_id, config.db_path)
-        if not event:
+        event = data.get("current_event", {})
+
+        if not event_id or not event:
             await message.answer("❌ Мероприятие не найдено.")
             return
 
@@ -214,10 +310,11 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
         success = await publish_to_channel(
             bot=bot,
             channel_id=config.channel_id,
-            event=event,
+            event_id=event_id,
             telegram_text=tg_text,
             ref_url=ref_url,
             image_url=image_url,
+            db_path=config.db_path,
         )
 
         if success:
@@ -236,10 +333,15 @@ async def _show_post_preview(
 ) -> None:
     await state.set_state(Flow.confirming_post)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Опубликовать", callback_data="confirm_post"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_post"),
-    ]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data="confirm_post"),
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_text"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Игнорировать", callback_data="ignore_event"),
+        ],
+    ])
 
     caption = f"<b>Предпросмотр поста:</b>\n\n{tg_text}"
 

@@ -13,12 +13,15 @@ def init_publisher(db_path: str) -> None:
 async def publish_to_channel(
     bot: Bot,
     channel_id: int,
-    event: dict,
+    event_id: int,
     telegram_text: str,
     ref_url: str,
     image_url: str | None,
+    db_path: str | None = None,
 ) -> bool:
-    from database.db import mark_as_published
+    from database.db import update_event_status
+
+    path = db_path or _db_path
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎟 Купить билет", url=ref_url)
@@ -38,11 +41,12 @@ async def publish_to_channel(
                 text=telegram_text[:4096],
                 reply_markup=kb,
             )
-        await mark_as_published(event["id"], _db_path)
-        logger.info(f"Published #{event['id']}: {event.get('title')}")
+        # Обновляем статус: published (уже должен быть published, но на всякий случай)
+        await update_event_status(event_id, "published", path)
+        logger.info(f"Published event #{event_id}")
         return True
     except Exception as e:
-        logger.error(f"Publish failed #{event.get('id')}: {e}")
+        logger.error(f"Publish failed #{event_id}: {e}")
         return False
 
 
