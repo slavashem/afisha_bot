@@ -24,6 +24,7 @@ class Flow(StatesGroup):
     confirming_post = State()
     waiting_ref_url = State()
     editing_text = State()
+    changing_photo = State()  # смена фото из предпросмотра
 
 
 # ─── Show event list ────────────────────────────────────────────────────────
@@ -259,6 +260,122 @@ def register_publish_handlers(router: Router, bot: Bot, config: Config) -> None:
             await callback.message.answer("🚫 Мероприятие проигнорировано.")
         await callback.answer("Игнорировано")
 
+    # ── Сменить фото (из предпросмотра) ─────────────────────────────────────
+
+    @router.callback_query(F.data == "change_photo", Flow.confirming_post)
+    async def on_change_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        data = await state.get_data()
+        image_urls: list[str] = data.get("image_urls", [])
+
+        await state.set_state(Flow.changing_photo)
+        await callback.answer()
+
+        if image_urls:
+            # Показываем уже найденные фото — пусть выберет другое
+            await callback.message.answer(
+                f"📸 Выберите другое фото ({len(image_urls)} вариантов):"
+            )
+            for i, img_url in enumerate(image_urls):
+                try:
+                    await callback.message.answer_photo(
+                        photo=img_url,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(
+                                text="✅ Выбрать это фото",
+                                callback_data=f"repick_photo:{i}",
+                            )
+                        ]])
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not send photo {i} ({img_url}): {e}")
+        else:
+            # Фото не было — предлагаем новый поиск или ввод URL вручную
+            await callback.message.answer(
+                "📸 Ранее фото не найдено. Введите прямую ссылку на изображение (https://...):",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔍 Найти фото заново", callback_data="research_photo"),
+                ]])
+            )
+
+    @router.callback_query(F.data.startswith("repick_photo:"), Flow.changing_photo)
+    async def on_repick_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        photo_idx = int(callback.data.split(":")[1])
+        data = await state.get_data()
+        image_urls: list[str] = data.get("image_urls", [])
+        selected_url = image_urls[photo_idx] if photo_idx < len(image_urls) else ""
+
+        await state.update_data(selected_image=selected_url)
+        await callback.answer("Фото обновлено ✅")
+
+        event = data.get("current_event", {})
+        tg_text = data.get("tg_text", "")
+        await callback.message.answer("Новый предпросмотр:")
+        await _show_post_preview(callback.message, event, tg_text, selected_url, state)
+
+    @router.callback_query(F.data == "research_photo", Flow.changing_photo)
+    async def on_research_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user.id != config.admin_id:
+            return
+
+        data = await state.get_data()
+        event = data.get("current_event", {})
+
+        await callback.answer()
+        await callback.message.answer("🔍 Ищу фото заново...")
+
+        query = build_image_query(event)
+        image_urls = await search_event_images(query, count=8)  # больше вариантов
+
+        if not image_urls:
+            await callback.message.answer(
+                "⚠️ Фото не найдены. Отправьте прямую ссылку на изображение (https://...):"
+            )
+            return
+
+        await state.update_data(image_urls=image_urls)
+        await callback.message.answer(
+            f"📸 Найдено {len(image_urls)} фото. Выберите:"
+        )
+        for i, img_url in enumerate(image_urls):
+            try:
+                await callback.message.answer_photo(
+                    photo=img_url,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="✅ Выбрать это фото",
+                            callback_data=f"repick_photo:{i}",
+                        )
+                    ]])
+                )
+            except Exception as e:
+                logger.warning(f"Could not send photo {i} ({img_url}): {e}")
+
+    @router.message(Flow.changing_photo)
+    async def on_manual_photo_url(message: Message, state: FSMContext) -> None:
+        """Позволяет вставить прямую ссылку на фото вручную."""
+        if message.from_user.id != config.admin_id:
+            return
+
+        url = (message.text or "").strip()
+        if not url.startswith("http"):
+            await message.answer("❌ Нужна прямая ссылка на изображение (https://...). Попробуйте ещё раз:")
+            return
+
+        await state.update_data(selected_image=url)
+
+        data = await state.get_data()
+        event = data.get("current_event", {})
+        tg_text = data.get("tg_text", "")
+
+        await message.answer("✅ Фото обновлено. Новый предпросмотр:")
+        await _show_post_preview(message, event, tg_text, url, state)
+
     # ── Редактировать текст ─────────────────────────────────────────────────
 
     @router.callback_query(F.data == "edit_text", Flow.confirming_post)
@@ -397,6 +514,7 @@ async def _show_post_preview(
             InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_text"),
         ],
         [
+            InlineKeyboardButton(text="🔄 Сменить фото", callback_data="change_photo"),
             InlineKeyboardButton(text="🚫 Игнорировать", callback_data="ignore_event"),
         ],
     ])
